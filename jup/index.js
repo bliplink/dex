@@ -46,7 +46,7 @@ async function getJupiterSwapTransaction(quoteResponse, userPublicKey) {
 const app = express();
 
 // 3. 定义端口号，优先使用环境变量指定的端口，否则默认为 3000
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 30000;
 
 // 解析 application/json 格式的请求体
 app.use(express.json());
@@ -176,6 +176,321 @@ app.use((error, req, res, next) => {
     });
 });
 
+
+ /**
+ * 获取钱包所有 Token 余额的接口 - 集成 Jupiter v2/search API
+ */
+app.get('/wallet-tokens', async (req, res) => {
+    try {
+        const { 
+            address, 
+            rpcUrl = 'https://api.mainnet-beta.solana.com',
+            includeLogo = 'true',
+            includeTags = 'true'
+        } = req.query;
+
+        // 参数验证
+        if (!address) {
+            return res.status(400).json({
+                success: false,
+                error: 'Missing required parameter: address',
+                example: '/wallet-tokens?address=YOUR_WALLET_ADDRESS&rpcUrl=OPTIONAL_RPC_URL'
+            });
+        }
+
+        // 验证钱包地址格式
+        try {
+            new PublicKey(address);
+        } catch (error) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid Solana wallet address format'
+            });
+        }
+
+        console.log(`查询钱包余额: ${address}, 使用 RPC: ${rpcUrl}`);
+
+        // 创建 Solana 连接
+        const connection = new Connection(rpcUrl, 'confirmed');
+        const publicKey = new PublicKey(address);
+
+        // 1. 获取主网 SOL 余额
+        const solBalance = await connection.getBalance(publicKey);
+        const solBalanceInSOL = solBalance / LAMPORTS_PER_SOL;
+
+        // 2. 获取所有 SPL Token 账户
+        const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+            publicKey,
+            { programId: TOKEN_PROGRAM_ID }
+        );
+
+        // 3. 提取所有代币 mint 地址用于批量查询元数据
+        const mintAddresses = [];
+        const tokenAccountMap = new Map(); // 用于快速查找账户信息
+        
+        tokenAccounts.value.forEach(account => {
+            const accountData = account.account.data.parsed.info;
+            const tokenAmount = accountData.tokenAmount;
+            
+            if (tokenAmount.uiAmount > 0) {
+                mintAddresses.push(accountData.mint);
+                tokenAccountMap.set(accountData.mint, {
+                    accountInfo: accountData,
+                    pubkey: account.pubkey.toString()
+                });
+            }
+        });
+
+        // 4. 批量获取代币元数据 [1](@ref)
+        let tokenMetadata = [];
+        if (mintAddresses.length > 0) {
+            tokenMetadata = await getTokenMetadataFromJupiterV2({
+                query: mintAddresses.join(','),
+                exactMatch: true,
+                limit: mintAddresses.length
+            });
+        }
+
+        // 5. 构建代币信息映射表
+        const tokenInfoMap = new Map();
+        tokenMetadata.forEach(token => {
+            tokenInfoMap.set(token.address, {
+                symbol: token.symbol,
+                name: token.name,
+                logoURI: token.logoURI,
+                tags: token.tags || [],
+                verified: true,
+                source: 'jupiter-v2',
+                usdPrice:token.usdPrice
+            });
+        });
+
+        // 6. 处理 Token 数据
+        const tokens = [];
+        
+        // 添加 SOL 余额
+        if (solBalanceInSOL > 0) {
+            tokens.push({
+                mint: NATIVE_MINT.toBase58(),
+                symbol: 'SOL',
+                name: 'Solana',
+                balance: solBalance,
+                decimals: 9,
+                uiAmount: solBalanceInSOL,
+                isNative: true,
+                tokenAccount: publicKey.toString(),
+                logoURI: 'https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/So11111111111111111111111111111111111111112/logo.png',
+                verified: true,
+                source: 'native'
+            });
+        }
+
+        // 7. 处理 SPL Tokens
+        tokenAccounts.value.forEach(account => {
+            const accountData = account.account.data.parsed.info;
+            const tokenAmount = accountData.tokenAmount;
+            
+            if (tokenAmount.uiAmount > 0) {
+                try {
+                    // 从 Jupiter API 获取代币元数据 [1](@ref)
+                    const jupiterTokenInfo = tokenInfoMap.get(accountData.mint);
+                    
+                    let tokenInfo;
+                    if (jupiterTokenInfo) {
+                        // 使用 Jupiter 返回的准确信息
+                        tokenInfo = {
+                            symbol: jupiterTokenInfo.symbol,
+                            name: jupiterTokenInfo.name,
+                            logoURI: jupiterTokenInfo.logoURI,
+                            tags: jupiterTokenInfo.tags,
+                            verified: true,
+                            source: 'jupiter-v2',
+                            usdPrice:jupiterTokenInfo.usdPrice
+                        };
+                    }  
+                    const tokenData = {
+                        mint: accountData.mint,
+                        symbol: tokenInfo.symbol,
+                        name: tokenInfo.name,
+                        balance: Number(tokenAmount.amount),
+                        decimals: tokenAmount.decimals,
+                        uiAmount: tokenAmount.uiAmount,
+                        isNative: false,
+                        tokenAccount: account.pubkey.toString(),
+                        verified: tokenInfo.verified,
+                        source: tokenInfo.source,
+                        usdPrice:tokenInfo.usdPrice
+                    };
+
+                    // 根据参数决定是否包含可选字段
+                    if (includeLogo === 'true' && tokenInfo.logoURI) {
+                        tokenData.logoURI = tokenInfo.logoURI;
+                    }
+                    
+                    if (includeTags === 'true' && tokenInfo.tags) {
+                        tokenData.tags = tokenInfo.tags;
+                    }
+                    if(tokenData.usdPrice){
+                    tokens.push(tokenData);
+                    }
+                } catch (error) {
+                    console.error(`处理代币账户 ${account.pubkey.toString()} 时出错:`, error);
+                    
+                    // 即使元数据获取失败，也返回基础余额信息
+                    tokens.push({
+                        mint: accountData.mint,
+                        symbol: 'UNKNOWN',
+                        name: 'Unknown Token',
+                        balance: Number(tokenAmount.amount),
+                        decimals: tokenAmount.decimals,
+                        uiAmount: tokenAmount.uiAmount,
+                        isNative: false,
+                        tokenAccount: account.pubkey.toString(),
+                        verified: false,
+                        source: 'fallback',
+                        error: 'Metadata fetch failed'
+                    });
+                }
+            }
+        });
+
+        // 8. 返回结果
+        res.json({
+            success: true,
+            wallet: address,
+            rpcUrl: rpcUrl,
+            totalTokens: tokens.length,
+            tokens: tokens,
+            summary: {         
+                solBalance: solBalanceInSOL,
+                splTokensCount: tokens.filter(t => !t.isNative).length,
+                verifiedTokensCount: tokens.filter(t => t.verified).length,
+                unverifiedTokensCount: tokens.filter(t => !t.verified).length
+            },
+            metadata: {
+                source: 'Jupiter v2/search API + Solana RPC',
+                totalMintsQueried: mintAddresses.length,
+                successfulMetadataQueries: tokenMetadata.length,
+                queryTime: new Date().toISOString()
+            }
+        });
+
+    } catch (error) {
+        console.error('Error fetching wallet tokens:', error);
+        
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            wallet: req.query.address || 'unknown',
+            suggestion: '请检查钱包地址格式和RPC连接状态'
+        });
+    }
+});
+
+/**
+ * 获取代币元数据的 GET 接口
+ * 通过 Jupiter v2/search API 查询代币信息
+ */
+app.get('/token-metadata', async (req, res) => {
+    try {
+        const { 
+            query,          // 支持代币地址、符号或名称查询
+            rpcUrl,         // 保留参数，虽然本接口不使用
+            exactMatch = 'false', // 是否精确匹配
+            limit = '50'    // 返回结果数量限制
+        } = req.query;
+
+        // 参数验证
+        if (!query) {
+            return res.status(400).json({
+                success: false,
+                error: 'Missing required parameter: query',
+                example: '/token-metadata?query=USDC',
+                description: '可传入代币地址、符号或名称进行搜索'
+            });
+        }
+
+        console.log(`查询代币元数据: ${query}`);
+
+        // 调用 Jupiter API 获取代币元数据
+        const tokenMetadata = await getTokenMetadataFromJupiterV2({
+            query,
+            exactMatch: exactMatch === 'true',
+            limit: parseInt(limit)
+        });
+        
+        // 返回成功响应
+        res.json({
+            success: true,
+            metadata: {
+                source: 'Jupiter v2/search API',
+                query: query,
+                exactMatch: exactMatch === 'true',
+                limit: parseInt(limit),
+                found: tokenMetadata.length,
+                queryTime: new Date().toISOString()
+            },
+            tokens: tokenMetadata
+        });
+
+    } catch (error) {
+        console.error('Error in token-metadata endpoint:', error);
+        
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            query: req.query.query || 'unknown',
+            suggestion: '请检查查询参数或稍后重试'
+        });
+    }
+});
+
+/**
+ * 使用 Jupiter v2/search API 获取代币元数据
+ * @param {Object} params 
+ * @param {string} params.query 查询字符串（地址/符号/名称）
+ * @param {boolean} [params.exactMatch] 是否精确匹配
+ * @param {number} [params.limit=50] 返回结果数量限制
+ */
+async function getTokenMetadataFromJupiterV2({ query, exactMatch = false, limit = 50 }) {
+    try {
+        const response = await axios.get(
+            'https://lite-api.jup.ag/tokens/v2/search', 
+            {
+                params: {
+                    query: query,
+                    exactMatch: exactMatch,
+                    limit: limit
+                },
+                timeout: 10000,
+                headers: {
+                    'Accept': 'application/json',
+                    'User-Agent': 'TokenMetadataAPI/1.0'
+                }
+            }
+        );
+        
+        // 处理返回数据
+        return (response.data || []).map(token => ({
+            address: token.id, 
+            symbol: token.symbol,
+            name: token.name,
+            decimals: token.decimals,
+            logoURI: token.icon,          
+            usdPrice:token.usdPrice,
+            verified: true
+            
+        }));
+    } catch (error) {
+        console.error('Jupiter API 错误:', {
+            url: error.config?.url,
+            status: error.response?.status,
+            data: error.response?.data
+        });
+        
+        throw new Error(`Jupiter API 请求失败: ${error.message}`);
+    }
+}
 // 5. 启动服务器，开始监听指定端口
 app.listen(port, () => {
     console.log(`Express服务器正在运行 http://localhost:${port}`);
