@@ -63,7 +63,7 @@ app.post('/jupswap', async (req, res) => {
             inputMint, 
             inputAmount, 
             outputMint, 
-            rpcUrl, 
+            rpcUrl = 'https://api.mainnet-beta.solana.com',
             signer 
         } = req.body;
 
@@ -95,7 +95,7 @@ app.post('/jupswap', async (req, res) => {
         }
 
         // 创建 Solana 连接
-        const connection = new Connection(rpcUrl, 'confirmed');
+        const connection = new Connection(rpcUrl, 'processed');
 
         // 7. 获取 Jupiter 报价[9](@ref)
         const quote = await getJupiterSwapQuote(
@@ -159,7 +159,7 @@ app.get('/jupswap', (req, res) => {
             inputMint: "So11111111111111111111111111111111111111112",
             inputAmount: "100",
             outputMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-            rpcUrl: "https://mainnet.helius-rpc.com/?api-key=3c947f86-9063-4c0b-9ae1-4c6882fba344",
+            rpcUrl : 'https://api.mainnet-beta.solana.com',
             signer: "your-private-key-in-bs58-format"
         }
     });
@@ -394,8 +394,7 @@ app.get('/wallet-tokens', async (req, res) => {
 app.get('/token-metadata', async (req, res) => {
     try {
         const { 
-            query,          // 支持代币地址、符号或名称查询
-            rpcUrl,         // 保留参数，虽然本接口不使用
+            query,          // 支持代币地址、符号或名称查询            
             exactMatch = 'false', // 是否精确匹配
             limit = '50'    // 返回结果数量限制
         } = req.query;
@@ -491,6 +490,69 @@ async function getTokenMetadataFromJupiterV2({ query, exactMatch = false, limit 
         throw new Error(`Jupiter API 请求失败: ${error.message}`);
     }
 }
+
+/**
+ * 验证私钥并返回公钥的GET接口
+ * 路径：/validate-key
+ * 参数：privateKey (Base58编码的私钥字符串)
+ */
+app.get('/validate-key', async (req, res) => {
+    // 初始化响应结构，确保即使出错也有基本框架
+    let response = {
+        success: false,
+        message: '',
+        publicKey: ''
+    };
+
+    try {
+        // 1. 获取并检查参数
+        const { privateKey } = req.query;
+
+        if (!privateKey) {
+            response.message = '缺少必要参数: privateKey';
+            return res.status(400).json(response);
+        }
+
+        // 2. 尝试将Base58字符串解码为字节数组
+        let secretKeyBytes;
+        try {
+            secretKeyBytes = bs58.default.decode(privateKey);
+        } catch (decodeError) {
+            response.message = '私钥格式无效：并非正确的Base58编码';
+            return res.status(400).json(response);
+        }
+
+        // 3. 验证字节长度（Solana密钥对通常为64字节）
+        if (secretKeyBytes.length !== 64) {
+            response.message = `私钥长度无效。期望64字节，实际得到${secretKeyBytes.length}字节`;
+            return res.status(400).json(response);
+        }
+
+        // 4. 核心验证：尝试从字节数组生成Keypair并提取公钥
+        try {
+            const keypair = Keypair.fromSecretKey(secretKeyBytes);
+            const publicKey = keypair.publicKey.toBase58();
+
+            // 5. 验证成功，构建成功响应
+            response.success = true;
+            response.message = '私钥验证成功，公钥已生成';
+            response.publicKey = publicKey;
+
+            res.json(response);
+
+        } catch (keypairError) {
+            response.message = '私钥无效：无法生成有效的密钥对。请检查私钥内容是否正确。';
+            return res.status(400).json(response);
+        }
+
+    } catch (error) {
+        // 捕获任何未预期的异常
+        console.error('验证接口发生未知错误:', error);
+        response.message = '服务器内部错误，验证过程失败';
+        res.status(500).json(response);
+    }
+});
+
 // 5. 启动服务器，开始监听指定端口
 app.listen(port, () => {
     console.log(`Express服务器正在运行 http://localhost:${port}`);
