@@ -211,17 +211,17 @@ app.get('/wallet-tokens', async (req, res) => {
         console.log(`查询钱包余额: ${address}, 使用 RPC: ${rpcUrl}`);
 
         // 创建 Solana 连接
-        const connection = new Connection(rpcUrl, 'confirmed');
+        const connection = new Connection(rpcUrl, 'processed');
         const publicKey = new PublicKey(address);
 
         // 1. 获取主网 SOL 余额
-        const solBalance = await connection.getBalance(publicKey);
+        const solBalance = await connection.getBalance(publicKey,"processed");
         const solBalanceInSOL = solBalance / LAMPORTS_PER_SOL;
 
         // 2. 获取所有 SPL Token 账户
         const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
             publicKey,
-            { programId: TOKEN_PROGRAM_ID }
+            { programId: TOKEN_PROGRAM_ID },"processed"
         );
 
         // 3. 提取所有代币 mint 地址用于批量查询元数据
